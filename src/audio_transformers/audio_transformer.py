@@ -1,5 +1,4 @@
 import os
-import logging
 from random import randint
 from typing import (
     Literal, 
@@ -11,6 +10,7 @@ from typing import (
 )
 
 import numpy as np
+from rich import print
 from tqdm.autonotebook import trange
 
 import torch
@@ -18,6 +18,7 @@ import torchaudio
 import torch.nn as nn
 from torch.nn.utils.rnn import PackedSequence
 
+from datasets import Audio
 from transformers import (
     AutoConfig, 
     AutoModel, 
@@ -25,7 +26,11 @@ from transformers import (
     is_torch_npu_available, 
 )
 
-logger = logging.getLogger(__name__)
+from . import util
+from . import logging
+
+logging.set_verbosity_info()
+logger = logging.get_logger(__name__)
 
 
 class Transformer(nn.Module):
@@ -56,6 +61,7 @@ class Transformer(nn.Module):
         config_args = shared_kwargs if config_args is None else {**shared_kwargs, **config_args}
 
         self.max_length_seconds = max_length_seconds
+        self.return_attention_mask = return_attention_mask
         
         self.config = AutoConfig.from_pretrained(
             model_name_or_path, 
@@ -88,7 +94,8 @@ class Transformer(nn.Module):
             features['padding_mask'] = padding_mask
         return features
 
-    def featurize(self, audios: List[str]):
+    def featurize(self, audios: Union[Dict[str, List[Any]], List[Any]]):
+        model_input_name = self.feature_extractor.model_input_names[0]
 
         def load_audio(audio_filename):
             waveform, sample_rate = torchaudio.load(audio_filename)
@@ -97,7 +104,13 @@ class Transformer(nn.Module):
             )
             return waveform.squeeze(dim=0)
 
-        audios = [load_audio(audio) for audio in audios]
+        if isinstance(audios, list) and isinstance(audios[0], str):
+            audios = [load_audio(audio) for audio in audios]
+        elif isinstance(audios, list) and isinstance(audios[0], dict) and ('array' in audios[0]):
+            audios = [audio['array'] for audio in audios]
+        # elif isinstance(audios, dict):
+        #     column = list(audios.keys())[0]
+        #     audios = [load_audio(audio) for audio in audios[column]]
 
         def random_subsample(wav: np.ndarray, max_length: float, sample_rate: int = 16000):
             """Randomly sample chunks of `max_length` seconds from the input audio"""
@@ -119,9 +132,9 @@ class Transformer(nn.Module):
             inputs = self.feature_extractor(
                 [to_numpy(wav) for wav in subsampled_wavs], 
                 sampling_rate=self.feature_extractor.sampling_rate, 
+                padding=True, 
                 return_tensors='pt'
             )
-            model_input_name = self.feature_extractor.model_input_names[0]
             outputs = {model_input_name: inputs.get(model_input_name)}
         else:
             wavs = [to_numpy(audio) for audio in audios]
@@ -131,6 +144,9 @@ class Transformer(nn.Module):
                 return_tensors='pt'
             )
             outputs = {model_input_name: inputs.get(model_input_name)}
+
+        if self.return_attention_mask and 'attention_mask' in inputs:
+            outputs['attention_mask'] = inputs['attention_mask']
             
         return outputs
 
@@ -264,7 +280,9 @@ class AudioTransformer(nn.Module):
 
         if device is None:
             self.device = self.get_device_name()
-            logger.info(f"Use pytorch device_name: {self.device}")
+        else:
+            self.device = device
+        logger.info(f"Use pytorch device_name: {self.device}")
 
         self.model_name_or_path = model_name_or_path
         if model_name_or_path is not None and model_name_or_path != "":
@@ -292,6 +310,7 @@ class AudioTransformer(nn.Module):
                     pooling_mode=pooling_mode, 
                     hidden_size=self.transformer_model.config.hidden_size
                 )
+        self.to(self.device)
 
     def encode(
         self, 
@@ -305,7 +324,50 @@ class AudioTransformer(nn.Module):
         convert_to_tensor: bool = False,
     ):
         """
-        Computes audio embeddings.
+        Computes embeddings for audio files or audio data.
+
+        This method processes audio data to compute embeddings, which can represent either 
+        entire segments or individual frames, based on the `output_value` parameter. 
+        The embeddings can optionally be normalized, converted to tensors or NumPy arrays, 
+        and returned in a format suitable for downstream tasks such as classification or retrieval.
+
+        Args:
+            audios (Union[str, List[str]]): The input audio(s), either as a single audio file path 
+                or a list of file paths.
+            batch_size (int, optional): The number of audio files to process in a single batch. 
+                Defaults to 16.
+            device (str, optional): The computation device to use (`'cpu'`, `'cuda'`, etc.). 
+                If not specified, uses the device associated with the model.
+            normalize_embeddings (bool, optional): Whether to normalize the computed embeddings 
+                to unit length. Defaults to False.
+            output_value (Literal["segment_embedding", "frame_embeddings"], optional): Specifies the type 
+                of embeddings to return:
+                - `'segment_embedding'`: Single embedding per audio segment.
+                - `'frame_embeddings'`: Sequence of embeddings for individual audio frames.
+                Defaults to `'segment_embedding'`.
+            show_progress_bar (bool, optional): Whether to display a progress bar during processing. 
+                Defaults to False.
+            convert_to_numpy (bool, optional): If True, converts the embeddings to NumPy arrays. 
+                Defaults to True.
+            convert_to_tensor (bool, optional): If True, converts the embeddings to PyTorch tensors. 
+                If both `convert_to_numpy` and `convert_to_tensor` are True, PyTorch tensors are prioritized. 
+                Defaults to False.
+
+        Returns:
+            Union[torch.Tensor, np.ndarray, List[torch.Tensor]]: The computed embeddings, depending on the 
+            specified options:
+                - A single embedding if `audios` is a string.
+                - A list of embeddings if `audios` is a list of file paths.
+                - The format of embeddings (PyTorch tensor, NumPy array, or list) depends on the values of 
+                `convert_to_numpy` and `convert_to_tensor`.
+
+        Raises:
+            ValueError: If both `convert_to_numpy` and `convert_to_tensor` are set to False.
+
+        Examples:
+            >>> embeddings = model.encode("example.wav", output_value="segment_embedding")
+            >>> embeddings = model.encode(["audio1.wav", "audio2.wav"], batch_size=8, normalize_embeddings=True)
+            >>> tensor_embeddings = model.encode("example.wav", convert_to_tensor=True)
         """
         self.eval()
 
@@ -357,9 +419,9 @@ class AudioTransformer(nn.Module):
         elif convert_to_numpy:
             if not isinstance(all_embeddings, np.ndarray):
                 if all_embeddings and all_embeddings[0].dtype == torch.bfloat16:
-                    all_embeddings = np.asarray([emb.float().numpy() for emb in all_embeddings])
+                    all_embeddings = np.asarray([to_numpy(emb.float()) for emb in all_embeddings])
                 else:
-                    all_embeddings = np.asarray([emb.numpy() for emb in all_embeddings])
+                    all_embeddings = np.asarray([to_numpy(emb) for emb in all_embeddings])
         elif isinstance(all_embeddings, np.ndarray):
             all_embeddings = [torch.from_numpy(embedding) for embedding in all_embeddings]
 
@@ -367,6 +429,33 @@ class AudioTransformer(nn.Module):
             all_embeddings = all_embeddings[0]
 
         return all_embeddings
+
+    def forward(
+        self,
+        features: Union[str, torch.Tensor],
+        labels: Optional[torch.Tensor] = None,
+    ):
+        """
+        Forward pass for training or inference.
+        
+        Args:
+            features: Audio features.
+            batch_size: Batch size for processing.
+            device: Device to run the computation on.
+            normalize_embeddings: If True, normalize embeddings to unit length.
+            output_value: Determines the output type - "segment_embedding" or "frame_embeddings".
+            return_loss: If True, computes and returns loss (requires labels).
+            labels: Target labels for supervised training.
+
+        Returns:
+            Dict containing model outputs and optionally the loss if `return_loss` is True.
+        """
+        features = batch_to_device(features, self.device)
+
+        out_features = self.transformer_model.forward(features)
+        out_features = self.pooling_model.forward(out_features)
+
+        return out_features
 
     def get_device_name(self) -> Literal["mps", "cuda", "npu", "hpu", "cpu"]:
         """
@@ -383,6 +472,11 @@ class AudioTransformer(nn.Module):
         elif is_torch_npu_available():
             return "npu"
         return "cpu"
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
+        # Propagate the gradient checkpointing to the transformer model
+        if isinstance(self.transformer_model, Transformer):
+            return self.transformer_model.auto_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
     
 
 def batch_to_device(batch: Dict[str, Any], target_device: str) -> dict[str, Any]:
@@ -419,21 +513,3 @@ def is_torch_data_type(x):
 def is_pandas_ndframe(x):
     # the sklearn way of determining this
     return hasattr(x, 'iloc')
-
-
-if __name__ == "__main__":
-    audios = [
-        '/mnt/data1_HDD_14TB/yang/corpus/audio/VoxCeleb1/test/wav/id10270/x6uYqmx31kE/00001.wav', 
-        '/mnt/data1_HDD_14TB/yang/corpus/audio/VoxCeleb1/test/wav/id10270/x6uYqmx31kE/00002.wav', 
-        '/mnt/data1_HDD_14TB/yang/corpus/audio/VoxCeleb1/test/wav/id10270/x6uYqmx31kE/00003.wav', 
-        '/mnt/data1_HDD_14TB/yang/corpus/audio/VoxCeleb1/test/wav/id10270/x6uYqmx31kE/00004.wav', 
-    ]
-    audio_transformer = AudioTransformer(
-        model_name_or_path='facebook/wav2vec2-base', 
-        max_length_seconds=3, 
-        return_attention_mask=True, 
-        pooling_mode='mean', 
-    )
-    embeddings = audio_transformer.encode(audios, batch_size=2, show_progress_bar=True, convert_to_tensor=True)
-    print(embeddings)
-    print(embeddings.shape)
