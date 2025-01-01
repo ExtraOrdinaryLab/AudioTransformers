@@ -1,13 +1,24 @@
 import os
-from typing import List, Union, Dict, Any, Callable, Tuple, Optional
+import warnings
+from typing import List, Union, Dict, Any, Callable, Tuple, Optional, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+import huggingface_hub.utils as hf_hub_utils
 from packaging.version import parse as parse_version
 from transformers import __version__ as transformers_version
-from transformers import Trainer, EvalPrediction, TrainerCallback
+from transformers import Trainer, TrainerCallback
 from transformers.data.data_collator import DataCollator
 from transformers.integrations import WandbCallback
+from transformers.trainer_callback import TrainerState
+from transformers.utils import is_sagemaker_mp_enabled
+from transformers.trainer_utils import (
+    EvalPrediction,
+    enable_full_determinism,
+    find_executable_batch_size,
+    get_last_checkpoint,
+    set_seed,
+)
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict, Value
 from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, SubsetRandomSampler
 
@@ -17,6 +28,18 @@ from .training_args import AudioTransformerTrainingArguments, BatchSamplers
 
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
+
+# Name of the files used for checkpointing
+TRAINING_ARGS_NAME = "training_args.bin"
+TRAINER_STATE_NAME = "trainer_state.json"
+OPTIMIZER_NAME = "optimizer.pt"
+OPTIMIZER_NAME_BIN = "optimizer.bin"
+SCHEDULER_NAME = "scheduler.pt"
+SCALER_NAME = "scaler.pt"
+FSDP_MODEL_NAME = "pytorch_model_fsdp"
+
+if TYPE_CHECKING:
+    import optuna
 
 
 class AudioTransformerDataCollator(object):
@@ -187,6 +210,125 @@ class AudioTransformerTrainer(Trainer):
         self.accelerator.even_batches = False
         self._train_dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
         return self._train_dataloader
+
+    def train(
+        self,
+        resume_from_checkpoint: Optional[Union[str, bool]] = None,
+        trial: Union["optuna.Trial", Dict[str, Any]] = None,
+        ignore_keys_for_eval: Optional[List[str]] = None,
+        **kwargs,
+    ):
+        self.train_embeddings(
+            resume_from_checkpoint, trial, ignore_keys_for_eval, **kwargs
+        )
+
+    def train_embeddings(
+        self,
+        resume_from_checkpoint: Optional[Union[str, bool]] = None,
+        trial: Union["optuna.Trial", Dict[str, Any]] = None,
+        ignore_keys_for_eval: Optional[List[str]] = None,
+        **kwargs,
+    ):
+        """
+        Main training entry point.
+
+        Args:
+            resume_from_checkpoint (`str` or `bool`, *optional*):
+                If a `str`, local path to a saved checkpoint as saved by a previous instance of [`Trainer`]. If a
+                `bool` and equals `True`, load the last checkpoint in *args.output_dir* as saved by a previous instance
+                of [`Trainer`]. If present, training will resume from the model/optimizer/scheduler states loaded here.
+            trial (`optuna.Trial` or `Dict[str, Any]`, *optional*):
+                The trial run or the hyperparameter dictionary for hyperparameter search.
+            ignore_keys_for_eval (`List[str]`, *optional*)
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions for evaluation during the training.
+            kwargs (`Dict[str, Any]`, *optional*):
+                Additional keyword arguments used to hide deprecated arguments
+        """
+        if resume_from_checkpoint is False:
+            resume_from_checkpoint = None
+
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
+
+        args = self.args
+
+        self.is_in_train = True
+
+        # Attach NEFTune hooks if necessary
+        if self.neftune_noise_alpha is not None:
+            self.model = self._activate_neftune(self.model)
+
+        # do_train is not a reliable argument, as it might not be set and .train() still called, so
+        # the following is a workaround:
+        if (args.fp16_full_eval or args.bf16_full_eval) and not args.do_train:
+            self._move_model_to_device(self.model, args.device)
+
+        if "model_path" in kwargs:
+            resume_from_checkpoint = kwargs.pop("model_path")
+            warnings.warn(
+                "`model_path` is deprecated and will be removed in a future version. Use `resume_from_checkpoint` "
+                "instead.",
+                FutureWarning,
+            )
+        if len(kwargs) > 0:
+            raise TypeError(f"train() received got unexpected keyword arguments: {', '.join(list(kwargs.keys()))}.")
+        # This might change the seed so needs to run first.
+        self._hp_search_setup(trial)
+        self._train_batch_size = self.args.train_batch_size
+
+        # Model re-init
+        model_reloaded = False
+        if self.model_init is not None:
+            # Seed must be set before instantiating the model when using model_init.
+            enable_full_determinism(self.args.seed) if self.args.full_determinism else set_seed(self.args.seed)
+            self.model = self.call_model_init(trial)
+            model_reloaded = True
+            # Reinitializes optimizer and scheduler
+            self.optimizer, self.lr_scheduler = None, None
+
+        # Load potential model checkpoint
+        if isinstance(resume_from_checkpoint, bool) and resume_from_checkpoint:
+            resume_from_checkpoint = get_last_checkpoint(args.output_dir)
+            if resume_from_checkpoint is None:
+                raise ValueError(f"No valid checkpoint found in output directory ({args.output_dir})")
+
+        if resume_from_checkpoint is not None:
+            if not is_sagemaker_mp_enabled() and not self.is_deepspeed_enabled and not self.is_fsdp_enabled:
+                self._load_from_checkpoint(resume_from_checkpoint)
+            # In case of repeating the find_executable_batch_size, set `self._train_batch_size` properly
+            state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+            if state.train_batch_size is not None:
+                self._train_batch_size = state.train_batch_size
+
+        # If model was re-initialized, put it on the right device and update self.model_wrapped
+        if model_reloaded:
+            if self.place_model_on_device:
+                self._move_model_to_device(self.model, args.device)
+            self.model_wrapped = self.model
+
+        inner_training_loop = find_executable_batch_size(
+            self._inner_training_loop, self._train_batch_size, args.auto_find_batch_size
+        )
+        if args.push_to_hub:
+            try:
+                # Disable progress bars when uploading models during checkpoints to avoid polluting stdout
+                hf_hub_utils.disable_progress_bars()
+                return inner_training_loop(
+                    args=args,
+                    resume_from_checkpoint=resume_from_checkpoint,
+                    trial=trial,
+                    ignore_keys_for_eval=ignore_keys_for_eval,
+                )
+            finally:
+                hf_hub_utils.enable_progress_bars()
+        else:
+            return inner_training_loop(
+                args=args,
+                resume_from_checkpoint=resume_from_checkpoint,
+                trial=trial,
+                ignore_keys_for_eval=ignore_keys_for_eval,
+            )
 
 
 def batch_to_device(batch: Dict[str, Any], target_device: str) -> dict[str, Any]:

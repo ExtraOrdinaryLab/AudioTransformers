@@ -58,3 +58,7 @@ def main():
         loss_fn=loss_fn
     )
     trainer.train()
+
+
+if __name__ == '__main__':
+    main()
