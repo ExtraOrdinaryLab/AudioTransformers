@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import List, Union
 from dataclasses import dataclass, field
 
 from transformers.utils import ExplicitEnum
@@ -26,11 +27,10 @@ class MultiDatasetBatchSamplers(ExplicitEnum):
 @dataclass
 class AudioTransformerTrainingArguments(TransformersTrainingArguments):
 
-    prompts: dict[str, dict[str, str]] | dict[str, str] | str | None = None
-    batch_sampler: BatchSamplers | str = field(
+    batch_sampler: Union[BatchSamplers, str] = field(
         default=BatchSamplers.BATCH_SAMPLER, metadata={"help": "The batch sampler to use."}
     )
-    multi_dataset_batch_sampler: MultiDatasetBatchSamplers | str = field(
+    multi_dataset_batch_sampler: Union[MultiDatasetBatchSamplers] = field(
         default=MultiDatasetBatchSamplers.PROPORTIONAL, metadata={"help": "The multi-dataset batch sampler to use."}
     )
 
