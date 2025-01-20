@@ -1,12 +1,18 @@
 import os
+import sys
+import json
+import shutil
+from pathlib import Path
 from random import randint
+from contextlib import contextmanager
 from typing import (
     Literal, 
     Any, 
     Union, 
     Dict, 
     Optional, 
-    List
+    List, 
+    Iterator
 )
 
 import numpy as np
@@ -16,9 +22,13 @@ from tqdm.autonotebook import trange
 import torch
 import torchaudio
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.utils.rnn import PackedSequence
+from safetensors.torch import load_model as load_safetensors_model
+from safetensors.torch import save_model as save_safetensors_model
 
-from datasets import Audio
+import transformers
+from transformers.dynamic_module_utils import get_relative_import_files
 from transformers import (
     AutoConfig, 
     AutoModel, 
@@ -26,8 +36,9 @@ from transformers import (
     is_torch_npu_available, 
 )
 
-from . import util
 from . import logging
+from .util import batch_to_device, fullname, import_from_string
+from .similarity_functions import SimilarityFunction
 
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
@@ -51,6 +62,7 @@ class Transformer(nn.Module):
         cache_dir: str = None,  # Path to store cached data and models, 
     ):
         super().__init__()
+        self.config_keys = ["max_length_seconds"]
         shared_kwargs = {
             "token": token, 
             "trust_remote_code": trust_remote_code, 
@@ -150,6 +162,31 @@ class Transformer(nn.Module):
             
         return outputs
 
+    def get_config_dict(self) -> dict[str, Any]:
+        return {key: self.__dict__[key] for key in self.config_keys}
+
+    def save(self, output_path: str, safe_serialization: bool = True) -> None:
+        self.auto_model.save_pretrained(output_path, safe_serialization=safe_serialization)
+        self.feature_extractor.save_pretrained(output_path)
+
+        with open(os.path.join(output_path, "audio_transformer_config.json"), "w") as fOut:
+            json.dump(self.get_config_dict(), fOut, indent=2)
+
+    @classmethod
+    def load(cls, input_path: str):
+        config_path = os.path.join(input_path, "audio_transformer_config.json")
+
+        with open(config_path) as fIn:
+            config = json.load(fIn)
+        # Don't allow configs to set trust_remote_code
+        if "model_args" in config and "trust_remote_code" in config["model_args"]:
+            config["model_args"].pop("trust_remote_code")
+        if "feature_extractor_args" in config and "trust_remote_code" in config["feature_extractor_args"]:
+            config["feature_extractor_args"].pop("trust_remote_code")
+        if "config_args" in config and "trust_remote_code" in config["config_args"]:
+            config["config_args"].pop("trust_remote_code")
+        return cls(model_name_or_path=input_path, **config)
+
 
 class Pooling(nn.Module):
 
@@ -162,6 +199,11 @@ class Pooling(nn.Module):
 
     def __init__(self, pooling_mode: str = None, hidden_size: int = None):
         super().__init__()
+        self.config_keys = [
+            "pooling_mode",
+            "hidden_size"
+        ]
+
         self.pooling_mode = pooling_mode
         self.hidden_size = hidden_size
 
@@ -257,6 +299,90 @@ class Pooling(nn.Module):
         features["segment_embedding"] = pooled_output
         return features
 
+    def get_config_dict(self) -> dict[str, Any]:
+        return {key: self.__dict__[key] for key in self.config_keys}
+
+    def save(self, output_path) -> None:
+        with open(os.path.join(output_path, "config.json"), "w") as fOut:
+            json.dump(self.get_config_dict(), fOut, indent=2)
+
+    @staticmethod
+    def load(input_path):
+        with open(os.path.join(input_path, "config.json")) as fIn:
+            config = json.load(fIn)
+        return Pooling(**config)
+
+
+class Dense(nn.Module):
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        activation_function = nn.Tanh(),
+        init_weight: torch.Tensor = None,
+        init_bias: torch.Tensor = None,
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bias = bias
+        self.activation_function = activation_function
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+
+        if init_weight is not None:
+            self.linear.weight = nn.Parameter(init_weight)
+
+        if init_bias is not None:
+            self.linear.bias = nn.Parameter(init_bias)
+
+    def forward(self, features: dict[str, torch.Tensor]):
+        features.update(
+            {"segment_embedding": self.activation_function(self.linear(features["segment_embedding"]))}
+        )
+        return features
+
+    def get_audio_embedding_dimension(self) -> int:
+        return self.out_features
+
+    def get_config_dict(self):
+        return {
+            "in_features": self.in_features,
+            "out_features": self.out_features,
+            "bias": self.bias,
+            "activation_function": fullname(self.activation_function),
+        }
+
+    def save(self, output_path, safe_serialization: bool = True) -> None:
+        with open(os.path.join(output_path, "config.json"), "w") as fOut:
+            json.dump(self.get_config_dict(), fOut)
+
+        if safe_serialization:
+            save_safetensors_model(self, os.path.join(output_path, "model.safetensors"))
+        else:
+            torch.save(self.state_dict(), os.path.join(output_path, "pytorch_model.bin"))
+
+    def __repr__(self):
+        return f"Dense({self.get_config_dict()})"
+
+    @staticmethod
+    def load(input_path):
+        with open(os.path.join(input_path, "config.json")) as fIn:
+            config = json.load(fIn)
+
+        config["activation_function"] = import_from_string(config["activation_function"])()
+        model = Dense(**config)
+        if os.path.exists(os.path.join(input_path, "model.safetensors")):
+            load_safetensors_model(model, os.path.join(input_path, "model.safetensors"))
+        else:
+            model.load_state_dict(
+                torch.load(
+                    os.path.join(input_path, "pytorch_model.bin"), map_location=torch.device("cpu"), weights_only=True
+                )
+            )
+        return model
+
 
 class AudioTransformer(nn.Module):
 
@@ -275,8 +401,11 @@ class AudioTransformer(nn.Module):
         revision: str = None, 
         cache_dir: str = None,  # Path to store cached data and models, 
         device: str = None,  # Set to None to automatically choose device, 
+        similarity_fn_name: Union[str, SimilarityFunction] = None,
     ):
         super().__init__()
+        self._model_config = {}
+        self.similarity_fn_name = similarity_fn_name
 
         if device is None:
             self.device = self.get_device_name()
@@ -310,6 +439,18 @@ class AudioTransformer(nn.Module):
                     pooling_mode=pooling_mode, 
                     hidden_size=self.transformer_model.config.hidden_size
                 )
+                self.projector_model = nn.Sequential(
+                    Dense(
+                        in_features=self.pooling_model.get_pooling_output_dimension(), 
+                        out_features=128, 
+                        activation_function=nn.LeakyReLU()
+                    ), 
+                    Dense(
+                        in_features=128, 
+                        out_features=128, 
+                        activation_function=nn.Identity()
+                    )
+                )
         self.to(self.device)
 
     def encode(
@@ -319,6 +460,7 @@ class AudioTransformer(nn.Module):
         device: str = None, 
         normalize_embeddings: bool = False,
         output_value: Literal["segment_embedding", "frame_embeddings"] = None, 
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = "float32",
         show_progress_bar: bool = False, 
         convert_to_numpy: bool = True,
         convert_to_tensor: bool = False,
@@ -408,6 +550,9 @@ class AudioTransformer(nn.Module):
 
                 all_embeddings.extend(embeddings)
             
+        if precision and precision != "float32":
+            all_embeddings = quantize_embeddings(all_embeddings, precision=precision)
+
         if convert_to_tensor:
             if len(all_embeddings):
                 if isinstance(all_embeddings, np.ndarray):
@@ -430,6 +575,15 @@ class AudioTransformer(nn.Module):
 
         return all_embeddings
 
+    @contextmanager
+    def truncate_audio_embeddings(self, truncate_dim: int = None) -> Iterator[None]:
+        original_output_dim = self.truncate_dim
+        try:
+            self.truncate_dim = truncate_dim
+            yield
+        finally:
+            self.truncate_dim = original_output_dim
+
     def forward(
         self,
         features: Union[str, torch.Tensor],
@@ -437,23 +591,13 @@ class AudioTransformer(nn.Module):
     ):
         """
         Forward pass for training or inference.
-        
-        Args:
-            features: Audio features.
-            batch_size: Batch size for processing.
-            device: Device to run the computation on.
-            normalize_embeddings: If True, normalize embeddings to unit length.
-            output_value: Determines the output type - "segment_embedding" or "frame_embeddings".
-            return_loss: If True, computes and returns loss (requires labels).
-            labels: Target labels for supervised training.
-
-        Returns:
-            Dict containing model outputs and optionally the loss if `return_loss` is True.
         """
         features = batch_to_device(features, self.device)
 
         out_features = self.transformer_model.forward(features)
         out_features = self.pooling_model.forward(out_features)
+        out_features = self.projector_model.forward(out_features)
+        out_features['segment_embedding'] = F.normalize(out_features['segment_embedding'], p=2, dim=1)
 
         return out_features
 
@@ -478,12 +622,106 @@ class AudioTransformer(nn.Module):
         if isinstance(self.transformer_model, Transformer):
             return self.transformer_model.auto_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
     
+    def save(
+        self,
+        path: str,
+        safe_serialization: bool = True,
+    ) -> None:
+        """
+        Saves a model and its configuration files to a directory, so that it can be loaded
+        with ``SentenceTransformer(path)`` again.
 
-def batch_to_device(batch: Dict[str, Any], target_device: str) -> dict[str, Any]:
-    for key in batch:
-        if isinstance(batch[key], torch.Tensor):
-            batch[key] = batch[key].to(target_device)
-    return batch
+        Args:
+            path (str): Path on disc where the model will be saved.
+            model_name (str, optional): Optional model name.
+            create_model_card (bool, optional): If True, create a README.md with basic information about this model.
+            train_datasets (List[str], optional): Optional list with the names of the datasets used to train the model.
+            safe_serialization (bool, optional): If True, save the model using safetensors. If False, save the model
+                the traditional (but unsafe) PyTorch way.
+        """
+        if path is None:
+            return
+
+        os.makedirs(path, exist_ok=True)
+
+        logger.info(f"Save model to {path}")
+        modules_config = []
+
+        # Save some model info
+        self._model_config["__version__"] = {
+            "transformers": transformers.__version__,
+            "pytorch": torch.__version__,
+        }
+
+        with open(os.path.join(path, "config_audio_transformers.json"), "w") as fOut:
+            config = self._model_config.copy()
+            config["similarity_fn_name"] = self.similarity_fn_name
+            json.dump(config, fOut, indent=2)
+
+        # Save modules
+        for idx, name in enumerate(self._modules):
+            module = self._modules[name]
+            if type(module).__name__ not in ['Transformer', 'Pooling']:
+                continue
+            if idx == 0 and hasattr(module, "save_in_root"):  # Save first module in the main folder
+                model_path = path + "/"
+            else:
+                model_path = os.path.join(path, str(idx) + "_" + type(module).__name__)
+
+            os.makedirs(model_path, exist_ok=True)
+            # Try to save with safetensors, but fall back to the traditional PyTorch way if the module doesn't support it
+            try:
+                module.save(model_path, safe_serialization=safe_serialization)
+            except TypeError:
+                module.save(model_path)
+
+            # "module" only works for Audio Transformers as the modules have the same names as the classes
+            class_ref = type(module).__module__
+            # For remote modules, we want to remove "transformers_modules.{repo_name}":
+            if class_ref.startswith("transformers_modules."):
+                class_file = sys.modules[class_ref].__file__
+
+                # Save the custom module file
+                dest_file = Path(model_path) / (Path(class_file).name)
+                shutil.copy(class_file, dest_file)
+
+                # Save all files importeed in the custom module file
+                for needed_file in get_relative_import_files(class_file):
+                    dest_file = Path(model_path) / (Path(needed_file).name)
+                    shutil.copy(needed_file, dest_file)
+
+                # For remote modules, we want to ignore the "transformers_modules.{repo_id}" part,
+                # i.e. we only want the filename
+                class_ref = f"{class_ref.split('.')[-1]}.{type(module).__name__}"
+            # For other cases, we want to add the class name:
+            elif not class_ref.startswith("audio_transformers."):
+                class_ref = f"{class_ref}.{type(module).__name__}"
+            modules_config.append({"idx": idx, "name": name, "path": os.path.basename(model_path), "type": class_ref})
+
+        with open(os.path.join(path, "modules.json"), "w") as fOut:
+            json.dump(modules_config, fOut, indent=2)
+
+    def save_pretrained(
+        self,
+        path: str,
+        safe_serialization: bool = True,
+    ) -> None:
+        """
+        Saves a model and its configuration files to a directory, so that it can be loaded
+        with ``AudioTransformer(path)`` again.
+
+        Args:
+            path (str): Path on disc where the model will be saved.
+            model_name (str, optional): Optional model name.
+            create_model_card (bool, optional): If True, create a README.md with basic information about this model.
+            train_datasets (List[str], optional): Optional list with the names of the datasets used to train the model.
+            safe_serialization (bool, optional): If True, save the model using safetensors. If False, save the model
+                the traditional (but unsafe) PyTorch way.
+        """
+        self.save(
+            path,
+            safe_serialization=safe_serialization,
+        )
 
 
 def to_numpy(X):
@@ -513,3 +751,77 @@ def is_torch_data_type(x):
 def is_pandas_ndframe(x):
     # the sklearn way of determining this
     return hasattr(x, 'iloc')
+
+
+def quantize_embeddings(
+    embeddings: Union[torch.Tensor, np.ndarray],
+    precision: Literal["float32", "int8", "uint8", "binary", "ubinary"],
+    ranges: np.ndarray = None,
+    calibration_embeddings: np.ndarray = None,
+) -> np.ndarray:
+    """
+    Quantizes embeddings to a lower precision. This can be used to reduce the memory footprint and increase the
+    speed of similarity search. The supported precisions are "float32", "int8", "uint8", "binary", and "ubinary".
+
+    Args:
+        embeddings: Unquantized (e.g. float) embeddings with to quantize
+            to a given precision
+        precision: The precision to convert to. Options are "float32",
+            "int8", "uint8", "binary", "ubinary".
+        ranges (Optional[np.ndarray]): Ranges for quantization of
+            embeddings. This is only used for int8 quantization, where
+            the ranges refers to the minimum and maximum values for each
+            dimension. So, it's a 2D array with shape (2,
+            embedding_dim). Default is None, which means that the ranges
+            will be calculated from the calibration embeddings.
+        calibration_embeddings (Optional[np.ndarray]): Embeddings used
+            for calibration during quantization. This is only used for
+            int8 quantization, where the calibration embeddings can be
+            used to compute ranges, i.e. the minimum and maximum values
+            for each dimension. Default is None, which means that the
+            ranges will be calculated from the query embeddings. This is
+            not recommended.
+
+    Returns:
+        Quantized embeddings with the specified precision
+    """
+    if isinstance(embeddings, torch.Tensor):
+        embeddings = embeddings.cpu().numpy()
+    elif isinstance(embeddings, list):
+        if isinstance(embeddings[0], torch.Tensor):
+            embeddings = [embedding.cpu().numpy() for embedding in embeddings]
+        embeddings = np.array(embeddings)
+    if embeddings.dtype in (np.uint8, np.int8):
+        raise Exception("Embeddings to quantize must be float rather than int8 or uint8.")
+
+    if precision == "float32":
+        return embeddings.astype(np.float32)
+
+    if precision.endswith("int8"):
+        # Either use the 1. provided ranges, 2. the calibration dataset or 3. the provided embeddings
+        if ranges is None:
+            if calibration_embeddings is not None:
+                ranges = np.vstack((np.min(calibration_embeddings, axis=0), np.max(calibration_embeddings, axis=0)))
+            else:
+                if embeddings.shape[0] < 100:
+                    logger.warning(
+                        f"Computing {precision} quantization buckets based on {len(embeddings)} embedding{'s' if len(embeddings) != 1 else ''}."
+                        f" {precision} quantization is more stable with `ranges` calculated from more embeddings "
+                        "or a `calibration_embeddings` that can be used to calculate the buckets."
+                    )
+                ranges = np.vstack((np.min(embeddings, axis=0), np.max(embeddings, axis=0)))
+        starts = ranges[0, :]
+        steps = (ranges[1, :] - ranges[0, :]) / 255
+
+        if precision == "uint8":
+            return ((embeddings - starts) / steps).astype(np.uint8)
+        elif precision == "int8":
+            return ((embeddings - starts) / steps - 128).astype(np.int8)
+
+    if precision == "binary":
+        return (np.packbits(embeddings > 0).reshape(embeddings.shape[0], -1) - 128).astype(np.int8)
+
+    if precision == "ubinary":
+        return np.packbits(embeddings > 0).reshape(embeddings.shape[0], -1)
+
+    raise ValueError(f"Precision {precision} is not supported")
