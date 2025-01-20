@@ -1,9 +1,13 @@
-from typing import Union, Any
+import logging
+import importlib
+from typing import Union, Any, Literal
+from contextlib import contextmanager
 
 import numpy as np
 
 import torch
 from torch import Tensor
+from torch.nn.utils.rnn import PackedSequence
 
 
 def _convert_to_tensor(a: Union[list, np.ndarray, Tensor]) -> Tensor:
@@ -265,3 +269,190 @@ def batch_to_device(batch: dict[str, Any], target_device: torch.device) -> dict[
         if isinstance(batch[key], Tensor):
             batch[key] = batch[key].to(target_device)
     return batch
+
+
+@contextmanager
+def disable_logging(highest_level=logging.CRITICAL):
+    """
+    A context manager that will prevent any logging messages
+    triggered during the body from being processed.
+
+    Args:
+        highest_level: the maximum logging level allowed.
+    """
+
+    previous_level = logging.root.manager.disable
+
+    logging.disable(highest_level)
+
+    try:
+        yield
+    finally:
+        logging.disable(previous_level)
+
+
+def fullname(o) -> str:
+    """
+    Gives a full name (package_name.class_name) for a class / object in Python. Will
+    be used to load the correct classes from JSON files
+
+    Args:
+        o: The object for which to get the full name.
+
+    Returns:
+        str: The full name of the object.
+
+    Example:
+        >>> from sentence_transformers.losses import MultipleNegativesRankingLoss
+        >>> from sentence_transformers import SentenceTransformer
+        >>> from sentence_transformers.util import fullname
+        >>> model = SentenceTransformer('all-MiniLM-L6-v2')
+        >>> loss = MultipleNegativesRankingLoss(model)
+        >>> fullname(loss)
+        'sentence_transformers.losses.MultipleNegativesRankingLoss.MultipleNegativesRankingLoss'
+    """
+
+    module = o.__class__.__module__
+    if module is None or module == str.__class__.__module__:
+        return o.__class__.__name__  # Avoid reporting __builtin__
+    else:
+        return module + "." + o.__class__.__name__
+
+
+def import_from_string(dotted_path: str) -> type:
+    """
+    Import a dotted module path and return the attribute/class designated by the
+    last name in the path. Raise ImportError if the import failed.
+
+    Args:
+        dotted_path (str): The dotted module path.
+
+    Returns:
+        Any: The attribute/class designated by the last name in the path.
+
+    Raises:
+        ImportError: If the import failed.
+
+    Example:
+        >>> import_from_string('sentence_transformers.losses.MultipleNegativesRankingLoss')
+        <class 'sentence_transformers.losses.MultipleNegativesRankingLoss.MultipleNegativesRankingLoss'>
+    """
+    try:
+        module_path, class_name = dotted_path.rsplit(".", 1)
+    except ValueError:
+        msg = f"{dotted_path} doesn't look like a module path"
+        raise ImportError(msg)
+
+    try:
+        module = importlib.import_module(dotted_path)
+    except Exception:
+        module = importlib.import_module(module_path)
+
+    try:
+        return getattr(module, class_name)
+    except AttributeError:
+        msg = f'Module "{module_path}" does not define a "{class_name}" attribute/class'
+        raise ImportError(msg)
+
+
+def to_numpy(X):
+    if isinstance(X, np.ndarray):
+        return X
+
+    if is_pandas_ndframe(X):
+        return X.values
+
+    if not is_torch_data_type(X):
+        raise TypeError("Cannot convert this data type to a numpy array.")
+
+    if X.is_cuda:
+        X = X.cpu()
+
+    if X.requires_grad:
+        X = X.detach()
+
+    return X.numpy()
+
+
+def is_torch_data_type(x):
+    # pylint: disable=protected-access
+    return isinstance(x, (torch.Tensor, PackedSequence))
+
+
+def is_pandas_ndframe(x):
+    # the sklearn way of determining this
+    return hasattr(x, 'iloc')
+
+
+def quantize_embeddings(
+    embeddings: Union[torch.Tensor, np.ndarray],
+    precision: Literal["float32", "int8", "uint8", "binary", "ubinary"],
+    ranges: np.ndarray = None,
+    calibration_embeddings: np.ndarray = None,
+) -> np.ndarray:
+    """
+    Quantizes embeddings to a lower precision. This can be used to reduce the memory footprint and increase the
+    speed of similarity search. The supported precisions are "float32", "int8", "uint8", "binary", and "ubinary".
+
+    Args:
+        embeddings: Unquantized (e.g. float) embeddings with to quantize
+            to a given precision
+        precision: The precision to convert to. Options are "float32",
+            "int8", "uint8", "binary", "ubinary".
+        ranges (Optional[np.ndarray]): Ranges for quantization of
+            embeddings. This is only used for int8 quantization, where
+            the ranges refers to the minimum and maximum values for each
+            dimension. So, it's a 2D array with shape (2,
+            embedding_dim). Default is None, which means that the ranges
+            will be calculated from the calibration embeddings.
+        calibration_embeddings (Optional[np.ndarray]): Embeddings used
+            for calibration during quantization. This is only used for
+            int8 quantization, where the calibration embeddings can be
+            used to compute ranges, i.e. the minimum and maximum values
+            for each dimension. Default is None, which means that the
+            ranges will be calculated from the query embeddings. This is
+            not recommended.
+
+    Returns:
+        Quantized embeddings with the specified precision
+    """
+    if isinstance(embeddings, torch.Tensor):
+        embeddings = embeddings.cpu().numpy()
+    elif isinstance(embeddings, list):
+        if isinstance(embeddings[0], torch.Tensor):
+            embeddings = [embedding.cpu().numpy() for embedding in embeddings]
+        embeddings = np.array(embeddings)
+    if embeddings.dtype in (np.uint8, np.int8):
+        raise Exception("Embeddings to quantize must be float rather than int8 or uint8.")
+
+    if precision == "float32":
+        return embeddings.astype(np.float32)
+
+    if precision.endswith("int8"):
+        # Either use the 1. provided ranges, 2. the calibration dataset or 3. the provided embeddings
+        if ranges is None:
+            if calibration_embeddings is not None:
+                ranges = np.vstack((np.min(calibration_embeddings, axis=0), np.max(calibration_embeddings, axis=0)))
+            else:
+                if embeddings.shape[0] < 100:
+                    logger.warning(
+                        f"Computing {precision} quantization buckets based on {len(embeddings)} embedding{'s' if len(embeddings) != 1 else ''}."
+                        f" {precision} quantization is more stable with `ranges` calculated from more embeddings "
+                        "or a `calibration_embeddings` that can be used to calculate the buckets."
+                    )
+                ranges = np.vstack((np.min(embeddings, axis=0), np.max(embeddings, axis=0)))
+        starts = ranges[0, :]
+        steps = (ranges[1, :] - ranges[0, :]) / 255
+
+        if precision == "uint8":
+            return ((embeddings - starts) / steps).astype(np.uint8)
+        elif precision == "int8":
+            return ((embeddings - starts) / steps - 128).astype(np.int8)
+
+    if precision == "binary":
+        return (np.packbits(embeddings > 0).reshape(embeddings.shape[0], -1) - 128).astype(np.int8)
+
+    if precision == "ubinary":
+        return np.packbits(embeddings > 0).reshape(embeddings.shape[0], -1)
+
+    raise ValueError(f"Precision {precision} is not supported")
