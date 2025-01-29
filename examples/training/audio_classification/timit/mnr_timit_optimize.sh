@@ -1,6 +1,6 @@
 #!/bin/bash
 
-DEVICE="1"
+DEVICE="0"
 
 MODEL_NAME="facebook/wav2vec2-base"
 OUTPUT_DIR="/mnt/data4_HDD_14TB/yang/confit-checkpoints/timit/confit"
@@ -8,7 +8,7 @@ OUTPUT_DIR="/mnt/data4_HDD_14TB/yang/confit-checkpoints/timit/confit"
 NUM_ITERATIONS=("10" "20")
 MAX_LENGTH="3"
 BATCH_SIZES=("256" "512" "1024")
-LEARNING_RATES=("1e-5" "2e-5" "5e-5" "1e-4" "2e-4" "5e-4")
+LEARNING_RATES=("2e-5" "5e-5" "1e-4" "2e-4")
 
 for ITERATIONS in "${NUM_ITERATIONS[@]}"; do
     for BATCH_SIZE in "${BATCH_SIZES[@]}"; do
@@ -22,6 +22,7 @@ for ITERATIONS in "${NUM_ITERATIONS[@]}"; do
                 --model_name_or_path $MODEL_NAME \
                 --dataset_name "confit/timit" \
                 --dataset_config_name "si" \
+                --trust_remote_code \
                 --output_dir "$OUTPUT_DIR/$EXP_NAME" \
                 --num_iterations $ITERATIONS \
                 --max_pairs "-1" \

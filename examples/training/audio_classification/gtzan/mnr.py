@@ -61,6 +61,16 @@ def parse_args():
         help="The configuration name of the dataset to use (via the datasets library)."
     )
     parser.add_argument(
+        "--force_redownload", 
+        action="store_true", 
+        help="",
+    )
+    parser.add_argument(
+        "--trust_remote_code", 
+        action="store_true", 
+        help="",
+    )
+    parser.add_argument(
         "--num_iterations", 
         type=int, 
         default=10, 
@@ -163,7 +173,8 @@ def main():
     raw_datasets = load_dataset(
         args.dataset_name, 
         args.dataset_config_name, 
-        trust_remote_code=True
+        trust_remote_code=args.trust_remote_code, 
+        download_mode=('force_redownload' if args.force_redownload else None)
     )
     logger.info(raw_datasets)
 

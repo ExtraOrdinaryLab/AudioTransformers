@@ -16,6 +16,7 @@ EXP_NAME="iter$NUM_ITERATIONS-len$MAX_LENGTH-bs$BATCH_SIZE-lr$LEARNING_RATE"
 CUDA_VISIBLE_DEVICES=$DEVICE /home/yang/miniconda3/envs/confit/bin/python mnr.py \
     --model_name_or_path $MODEL_NAME \
     --dataset_name "confit/gtzan" \
+    --trust_remote_code \
     --output_dir "$OUTPUT_DIR/$EXP_NAME" \
     --num_iterations $NUM_ITERATIONS \
     --max_pairs "-1" \

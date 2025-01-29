@@ -21,6 +21,7 @@ for ITERATIONS in "${NUM_ITERATIONS[@]}"; do
             CUDA_VISIBLE_DEVICES=$DEVICE /home/yang/miniconda3/envs/confit/bin/python mnr.py \
                 --model_name_or_path $MODEL_NAME \
                 --dataset_name "confit/gtzan" \
+                --trust_remote_code \
                 --output_dir "$OUTPUT_DIR/$EXP_NAME" \
                 --num_iterations $ITERATIONS \
                 --max_pairs "-1" \
